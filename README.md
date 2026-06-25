@@ -7,7 +7,9 @@ and the same `Find`/`Replace`/`Split`/submatch API surface.
 The implementation is validated by **differential testing against the actual Go
 `regexp` package**: tens of thousands of (pattern, input) pairs are run through
 both engines and the results are required to be byte-for-byte identical (see
-[Validation](#validation)).
+[Validation](#validation)). It is also **benchmarked head-to-head against Go** —
+competitive-to-faster on most patterns, and faster to compile (see
+[BENCHMARKS.md](BENCHMARKS.md)).
 
 ```
 $ zig build demo -- '(\w+)@(\w+)\.(\w+)' 'contact john@example.com today'
@@ -174,9 +176,9 @@ or **clearly-scoped data limits**:
 
 | Area | Status |
 |------|--------|
-| One-pass engine, bitstate backtracker | Not ported. They are speed optimizations; the Pike VM gives identical results. |
+| One-pass engine, bitstate backtracker | Not ported. They are speed optimizations; the Pike VM gives identical results. (They are the only two cases where Go still outruns this port — see [BENCHMARKS.md](BENCHMARKS.md).) |
 | Alternation prefix `factor()` | Not ported. A pure AST optimization; does not change the matched language or priority. |
-| Literal-prefix search acceleration | Computed (`literalPrefix`) but not used to skip input. Correctness unaffected. |
+| Literal-prefix search acceleration | **Implemented** (vectorized first-byte scan + verify); closes the literal-search gap with Go. See [BENCHMARKS.md](BENCHMARKS.md). |
 | `\p{...}` script/category set | A **curated subset** (common general categories `L,N,P,…` and major scripts: Latin, Greek, Cyrillic, Han, Hiragana, Katakana, Hangul, Arabic, Hebrew, Thai, Devanagari, Armenian, Georgian, Common). Unknown names return `error.InvalidCharRange`. |
 | `\p{...}` under `(?i)` | Uses the base table only (no case-fold table merge), equivalent to Go's behavior when a class has no fold table. |
 | `io.RuneReader` streaming input | Not ported; inputs are `[]const u8` (covers Go's string and `[]byte`). |

@@ -27,5 +27,8 @@ echo "generating random fuzz corpus (src/fuzz.jsonl) ..."
 echo "generating leftmost-longest corpus (src/longest.jsonl) ..."
 ( cd tools && go run genlongest.go ) > src/longest.jsonl
 
+echo "generating benchmark corpus (src/bench*.{jsonl,txt}) ..."
+( cd tools && go run genbench.go ) > src/bench.jsonl
+
 echo "done. counts:"
 wc -l src/cases.jsonl src/fuzz.jsonl src/longest.jsonl

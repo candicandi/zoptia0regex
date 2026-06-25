@@ -1,0 +1,15 @@
+{"name":"literal_hit","p":"performance","op":"find","in":"corpus"}
+{"name":"literal_miss","p":"zzqqxxjjkk","op":"find","in":"corpus"}
+{"name":"alternation","p":"performance|benchmark|expression|throughput","op":"findall","in":"corpus"}
+{"name":"charclass_word","p":"[A-Za-z]+","op":"findall","in":"corpus"}
+{"name":"perl_word","p":"\\w+","op":"findall","in":"corpus"}
+{"name":"digits","p":"\\d+","op":"findall","in":"corpus"}
+{"name":"date","p":"\\d{4}-\\d{2}-\\d{2}","op":"findall","in":"corpus"}
+{"name":"email","p":"[\\w.]+@[\\w.]+\\.\\w+","op":"findall","in":"corpus"}
+{"name":"email_submatch","p":"([\\w.]+)@([\\w.]+)\\.(\\w+)","op":"submatch","in":"corpus"}
+{"name":"anchored_multiline","p":"(?m)^\\w+","op":"findall","in":"corpus"}
+{"name":"unicode_letters","p":"\\p{L}+","op":"findall","in":"corpus"}
+{"name":"dotstar_greedy","p":"p.*e","op":"find","in":"corpus"}
+{"name":"redos_linear","p":"(a+)+$","op":"match","in":"aaa"}
+{"name":"nested_groups","p":"(\\w+)\\s+(\\w+)\\s+(\\w+)","op":"findall","in":"corpus"}
+{"name":"caseins_literal","p":"(?i)performance","op":"findall","in":"corpus"}

@@ -39,6 +39,16 @@ pub fn build(b: *std.Build) void {
     // Differential tests against Go's regexp output (golden reference).
     // The curated corpus (src/cases.jsonl) is committed; the large fuzz corpus
     // (src/fuzz.jsonl) is generated on demand by tools/regen.sh.
+    // Benchmark (always ReleaseFast). Compare with `cd tools && go run benchgo.go`.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_exe = b.addExecutable(.{ .name = "regex-bench", .root_module = bench_mod });
+    const bench_step = b.step("bench", "Run the Zig benchmark vs the shared corpus (ReleaseFast)");
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+
     const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz corpora)");
     inline for (.{ "src/difftest.zig", "src/fuzztest.zig", "src/longesttest.zig" }) |src| {
         const mod = b.createModule(.{

@@ -87,6 +87,24 @@ pub const Input = struct {
     }
 };
 
+/// Find the first occurrence of `needle` in `haystack`. Like Go's bytes.Index,
+/// it scans for the first byte with a vectorized search (`indexOfScalar`) and
+/// verifies the rest, which is much faster than a generic substring search for
+/// the common "rare first byte" case.
+fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) {
+        const rel = std.mem.indexOfScalar(u8, haystack[start..], needle[0]) orelse return null;
+        const at = start + rel;
+        if (at + needle.len > haystack.len) return null;
+        if (std.mem.eql(u8, haystack[at .. at + needle.len], needle)) return at;
+        start = at + 1;
+    }
+    return null;
+}
+
 /// Decode the final rune of `s`, returning U+FFFD on malformed trailing bytes.
 fn decodeLastRune(s: []const u8) i32 {
     if (s.len == 0) return end_of_text;
@@ -118,6 +136,8 @@ const Machine = struct {
     longest: bool,
     cond: EmptyOp,
     ncap: usize,
+    prefix: []const u8,
+    prefix_rune: i32,
     q0: Queue,
     q1: Queue,
     pool: std.ArrayList(*Thread) = .empty,
@@ -125,8 +145,16 @@ const Machine = struct {
     matched: bool = false,
     matchcap: []i64,
 
-    fn init(allocator: std.mem.Allocator, p: *const Prog, longest: bool, cond: EmptyOp, ncap: usize) !Machine {
+    fn init(allocator: std.mem.Allocator, p: *const Prog, longest: bool, cond: EmptyOp, prefix: []const u8, ncap: usize) !Machine {
         const ninst = p.insts.len;
+        var prune: i32 = -1;
+        if (prefix.len > 0) {
+            const n = std.unicode.utf8ByteSequenceLength(prefix[0]) catch 1;
+            prune = if (n <= prefix.len)
+                @intCast(std.unicode.utf8Decode(prefix[0..n]) catch 0xFFFD)
+            else
+                0xFFFD;
+        }
         // The sparse-set membership check reads sparse[pc] before it is written;
         // its correctness relies only on the dense cross-check, but Go's `make`
         // zero-initializes, so we do too to avoid reading indeterminate memory.
@@ -140,6 +168,8 @@ const Machine = struct {
             .longest = longest,
             .cond = cond,
             .ncap = ncap,
+            .prefix = prefix,
+            .prefix_rune = prune,
             .q0 = .{ .sparse = s0, .dense = try allocator.alloc(Entry, ninst) },
             .q1 = .{ .sparse = s1, .dense = try allocator.alloc(Entry, ninst) },
             .matchcap = try allocator.alloc(i64, ncap),
@@ -324,6 +354,20 @@ const Machine = struct {
             if (runq.n == 0) {
                 if (m.cond & prog.empty_begin_text != 0 and pos != 0) break; // anchored, past start
                 if (m.matched) break; // have match, done exploring
+                // Literal-prefix acceleration: every match must start with the
+                // prefix, so fast-forward to its next occurrence (memchr-class
+                // substring search) instead of stepping the NFA at every byte.
+                if (m.prefix.len > 0 and r1 != m.prefix_rune and pos <= input.s.len) {
+                    if (prefixIndex(input.s[pos..], m.prefix)) |adv| {
+                        pos += adv;
+                        const sa = input.step(pos);
+                        r = sa.r;
+                        width = sa.w;
+                        const sb = input.step(pos + width);
+                        r1 = sb.r;
+                        width1 = sb.w;
+                    } else break;
+                }
             }
             if (!m.matched) {
                 if (m.matchcap.len > 0) m.matchcap[0] = @intCast(pos);
@@ -359,11 +403,12 @@ pub fn execute(
     p: *const Prog,
     longest: bool,
     cond: EmptyOp,
+    prefix: []const u8,
     input: Input,
     pos: usize,
     caps: []i64,
 ) !bool {
-    var m = try Machine.init(allocator, p, longest, cond, caps.len);
+    var m = try Machine.init(allocator, p, longest, cond, prefix, caps.len);
     defer m.deinit();
     if (!try m.run(input, pos)) return false;
     @memcpy(caps, m.matchcap);
