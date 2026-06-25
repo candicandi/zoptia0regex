@@ -11,10 +11,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+      # Zig 0.16.0 is a zvk-managed build, not a plain ziglang.org release, so
+      # install the toolchain through zvk (https://github.com/zoptia/zvk).
+      # install.sh fetches a managed Go, builds zvk, and runs `zvk zig install`,
+      # leaving the `zig` shim in ~/.zvk/bin. GitHub Actions doesn't read shell
+      # rc files, so add that dir to PATH via $GITHUB_PATH.
+      - name: Install Zig via zvk
+        env:
+          ZVK_NO_DOCS: "1"
+          ZVK_NO_CLAUDE_MD: "1"
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/zoptia/zvk/main/install.sh | sh
+          echo "$HOME/.zvk/bin" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
 
       - name: Check formatting
         run: zig fmt --check src/*.zig build.zig
@@ -26,7 +37,7 @@ jobs:
         run: zig build test
 
       # The differential corpora are committed, so this runs without a Go
-      # toolchain — it replays ~30k cases recorded from Go and asserts the
-      # results are byte-for-byte identical (and leak-free).
+      # toolchain of its own — it replays ~30k cases recorded from Go and
+      # asserts the results are byte-for-byte identical (and leak-free).
       - name: Differential tests vs Go
         run: zig build difftest
