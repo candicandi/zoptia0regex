@@ -11,7 +11,7 @@ specific Go source file, and correctness is enforced by **differential testing
 against Go's actual recorded output** — not hand-written expectations alone.
 
 The Go reference source is on this machine at
-`/Users/jay/.zvk/go/versions/go1.26.4/src/regexp/` — **read the corresponding Go
+`~/.zvk/go/versions/go1.26.4/src/regexp/` — **read the corresponding Go
 file before changing any matching/parsing behaviour.** The port-to-Go file map:
 
 | Zig | Go |
