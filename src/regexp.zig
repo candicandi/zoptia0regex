@@ -23,6 +23,11 @@ pub const ExecError = std.mem.Allocator.Error;
 /// A matched byte range `input[start..end]`.
 pub const Match = struct { start: usize, end: usize };
 
+/// Reusable match storage for the allocation-free `*Scratch` API
+/// (`matchScratch` / `findSubmatchIndexScratch`). Allocate once, reuse across
+/// many matches on the same compiled `Regexp`. See `exec.Scratch`.
+pub const Scratch = exec.Scratch;
+
 pub const Regexp = struct {
     base_allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
@@ -100,6 +105,29 @@ pub const Regexp = struct {
     /// `[]const u8`).
     pub fn matchString(re: *const Regexp, allocator: std.mem.Allocator, s: []const u8) ExecError!bool {
         return re.match(allocator, s);
+    }
+
+    /// Like `match`, but reuses a caller-owned `Scratch` instead of allocating
+    /// per call. Allocate one `Scratch` (`Scratch.init(gpa)` / `deinit`) and
+    /// reuse it across many matches on the same compiled `Regexp`; after it has
+    /// warmed up, each call does zero heap allocation. Single-threaded: do not
+    /// share one `Scratch` between concurrent matches.
+    pub fn matchScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!bool {
+        if (input.len < re.min_input_len) return false;
+        var caps: [0]i64 = .{};
+        return try exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
+    }
+
+    /// Like `findSubmatchIndex`, but reuses a caller-owned `Scratch`. The
+    /// returned slice is owned by `scratch` and valid only until the next call
+    /// that reuses it — copy it if you need to keep it. Do NOT free it. Null if
+    /// there is no match.
+    pub fn findSubmatchIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?[]i64 {
+        if (input.len < re.min_input_len) return null;
+        const caps = try scratch.resultBuf(re.padLen());
+        const matched = try exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, caps);
+        if (!matched) return null;
+        return caps;
     }
 
     // --- find leftmost ---

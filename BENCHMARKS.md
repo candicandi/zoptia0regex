@@ -27,7 +27,9 @@ missing engine.
   dead-code elimination.
 - **Allocation.** The Zig harness resets an arena (`retain_capacity`) per
   iteration so scratch allocation is a cheap bump — the fair analogue of Go's
-  per-call machine `sync.Pool`.
+  per-call machine `sync.Pool`. The library also exposes a first-class
+  zero-allocation path (`matchScratch`); see
+  [Allocation-free matching](#allocation-free-matching-the-scratch-api) below.
 - **Same engine selection.** The port mirrors Go's dispatch exactly: the
   **one-pass** engine for qualifying anchored regexps, the **bitstate**
   backtracker for small programs/inputs, and the **Pike VM** otherwise; all with
@@ -113,10 +115,49 @@ a pure Pike-VM constant factor on the per-position case-fold check, not a
 missing engine. (The *anchored* counterpart, `anchored_caseins`, is one-pass and
 **faster** than Go.)
 
+## Allocation-free matching: the `Scratch` API
+
+Go pools its `*machine` per `Regexp` via `sync.Pool`, so a hot match loop
+allocates nothing in steady state. This port now offers the same through a
+caller-owned **`Scratch`**: allocate one (`Scratch.init(gpa)`), then call
+`re.matchScratch(&scratch, input)` / `re.findSubmatchIndexScratch(&scratch, …)`
+in a loop. After it warms up, **every call does zero heap allocation** — the
+sparse-set queues, thread pool and bitstate buffers are all reused, growing to a
+high-water mark and never shrinking. The existing `match` / `find` / … API is
+unchanged; it wraps the same code path with a temporary scratch.
+
+The win shows up on short-input hot loops, where the old per-call `Machine`
+allocation dominated. Same patterns, same 200 ms calibration, Apple M4,
+`-OReleaseFast` vs go1.26.4:
+
+| pattern | engine | Go `MatchString` | Zig `match` (alloc) | Zig `matchScratch` | scratch vs Go |
+|---------|--------|-----------------:|--------------------:|-------------------:|--------------:|
+| `needle` (literal) | bitstate+prefix | 47 | 56 | **26** | **0.55×** |
+| `\A\d+\z` (anchored) | one-pass | 90 | 61 | **53** | **0.59×** |
+| `[0-9]+` | bitstate | 90 | 129 | **89** | **0.99×** |
+| `(foo\|bar\|baz)+` | bitstate | 90 | 150 | **114** | 1.27× |
+| `[a-z]+@[a-z]+\.[a-z]+` | Pike VM | 376 | 535 | **458** | 1.22× |
+
+Reading the table: **before** the `Scratch` API, per-call allocation made the
+port 1.3–1.6× *slower* than Go's pooled machine on the bitstate / Pike-VM
+patterns (only the no-alloc one-pass path was already ahead). **After** it, the
+allocation gap is gone — the numbers reduce to pure engine throughput: Zig wins
+on literal (vectorized prefix scan) and anchored (one-pass), ties on a simple
+char class, and Go keeps a ~1.2–1.3× constant-factor edge on the unanchored
+Pike-VM scans (the same constant factor documented above, not allocation).
+
+> These are 20–50 byte inputs, where fixed per-op overhead weighs most and the
+> Pike-VM constant factor is most visible; on the 256 KB corpus above the port's
+> throughput pulls it to a **0.887×** geomean. The two views are consistent —
+> different input scales.
+
 ## Reproduce
 
 ```sh
-tools/regen.sh                       # (re)generate the corpus + cases
-zig build bench                      # Zig results (ReleaseFast) -> stderr TSV
-( cd tools && go run benchgo.go )    # Go results -> stdout TSV
+tools/regen.sh                              # (re)generate the corpus + cases
+zig build bench                             # Zig results (ReleaseFast) -> stderr TSV
+( cd tools && go run benchgo.go )           # Go results -> stdout TSV
+
+zig build bench-scratch                     # Zig Scratch-reuse benchmark
+( cd tools && go run bench_scratch_go.go )  # Go counterpart
 ```

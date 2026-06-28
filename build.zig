@@ -49,6 +49,16 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the Zig benchmark vs the shared corpus (ReleaseFast)");
     bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 
+    // Scratch-reuse micro-benchmark: re.match (allocating) vs re.matchScratch.
+    const bench_scratch_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_scratch.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_scratch_exe = b.addExecutable(.{ .name = "regex-bench-scratch", .root_module = bench_scratch_mod });
+    const bench_scratch_step = b.step("bench-scratch", "Benchmark the Scratch reuse API vs allocating match (ReleaseFast)");
+    bench_scratch_step.dependOn(&b.addRunArtifact(bench_scratch_exe).step);
+
     const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz corpora)");
     inline for (.{ "src/difftest.zig", "src/fuzztest.zig", "src/longesttest.zig" }) |src| {
         const mod = b.createModule(.{

@@ -99,6 +99,8 @@ walkthrough, see **[docs/internals.md](docs/internals.md)**.
   escapes; `\Q...\E`.
 - ⚖️ Two match modes: leftmost-first (Go default) and POSIX leftmost-longest.
 - 🛡️ Linear-time guarantee — immune to ReDoS.
+- ⚡ Allocation-free hot loops: reuse a `Scratch` across matches
+  (`matchScratch`) for zero-allocation steady state, like Go's machine pool.
 - 🌍 Full-Unicode case folding via Go-derived tables.
 - 🚫 Same intentional limits as RE2/Go: **no backreferences, no `\C`**.
 

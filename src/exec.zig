@@ -132,8 +132,123 @@ const Queue = struct {
     n: usize = 0,
 };
 
-const Machine = struct {
+/// Reusable per-call storage for the Pike-VM and bitstate engines — the
+/// equivalent of Go's per-`Regexp` `*machine` pool, which this port originally
+/// omitted (it allocated a fresh `Machine` on every match). Allocate a `Scratch`
+/// once and reuse it across many match calls on the same compiled `Regexp` so
+/// steady-state matching does zero heap allocation: every buffer grows to a
+/// high-water mark and is never shrunk, and threads stay pooled across runs.
+///
+/// Single-threaded: a `Scratch` carries no synchronisation and must not be used
+/// by two matches concurrently. See `regexp.matchScratch`.
+pub const Scratch = struct {
     allocator: std.mem.Allocator,
+
+    // --- Pike VM ---
+    s0: []u32 = &.{},
+    s1: []u32 = &.{},
+    dense0: []Entry = &.{},
+    dense1: []Entry = &.{},
+    matchcap: []i64 = &.{},
+    pool: std.ArrayList(*Thread) = .empty,
+    all_threads: std.ArrayList(*Thread) = .empty,
+    pike_ninst: usize = 0, // capacity of s0/s1/dense0/dense1 (grow-only)
+    thread_ncap: usize = 0, // exact cap-array length of pooled threads + matchcap
+
+    // --- bitstate backtracker ---
+    work: []i64 = &.{}, // working capture registers (grow-only)
+    visited: []u32 = &.{}, // (pc,pos) visited bitmap (grow-only)
+    jobs: std.ArrayList(Job) = .empty,
+
+    // --- borrowed result buffer for findSubmatchIndexScratch ---
+    result: []i64 = &.{},
+
+    pub fn init(allocator: std.mem.Allocator) Scratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Scratch) void {
+        const a = self.allocator;
+        for (self.all_threads.items) |t| {
+            if (t.cap.len > 0) a.free(t.cap);
+            a.destroy(t);
+        }
+        self.all_threads.deinit(a);
+        self.pool.deinit(a);
+        self.jobs.deinit(a);
+        if (self.s0.len > 0) a.free(self.s0);
+        if (self.s1.len > 0) a.free(self.s1);
+        if (self.dense0.len > 0) a.free(self.dense0);
+        if (self.dense1.len > 0) a.free(self.dense1);
+        if (self.matchcap.len > 0) a.free(self.matchcap);
+        if (self.work.len > 0) a.free(self.work);
+        if (self.visited.len > 0) a.free(self.visited);
+        if (self.result.len > 0) a.free(self.result);
+        self.* = undefined;
+    }
+
+    /// Grow the Pike-VM buffers to fit `ninst` instructions and `ncap` capture
+    /// slots. The sparse/dense buffers grow monotonically (oversized buffers are
+    /// harmless — only `[0, ninst)`/`[0, q.n)` are ever touched). When `ncap`
+    /// changes, the pooled threads (whose cap arrays are sized to the previous
+    /// `ncap`) are discarded so fresh ones are allocated at the new size; a hot
+    /// loop keeps `ncap` constant, so this fires only on the first call.
+    fn ensurePike(self: *Scratch, ninst: usize, ncap: usize) !void {
+        const a = self.allocator;
+        if (ninst > self.pike_ninst) {
+            if (self.s0.len > 0) a.free(self.s0);
+            if (self.s1.len > 0) a.free(self.s1);
+            if (self.dense0.len > 0) a.free(self.dense0);
+            if (self.dense1.len > 0) a.free(self.dense1);
+            self.s0 = try a.alloc(u32, ninst);
+            self.s1 = try a.alloc(u32, ninst);
+            self.dense0 = try a.alloc(Entry, ninst);
+            self.dense1 = try a.alloc(Entry, ninst);
+            self.pike_ninst = ninst;
+        }
+        if (ncap != self.thread_ncap) {
+            for (self.all_threads.items) |t| {
+                if (t.cap.len > 0) a.free(t.cap);
+                a.destroy(t);
+            }
+            self.all_threads.clearRetainingCapacity();
+            self.pool.clearRetainingCapacity();
+            if (self.matchcap.len > 0) a.free(self.matchcap);
+            self.matchcap = if (ncap > 0) try a.alloc(i64, ncap) else &.{};
+            self.thread_ncap = ncap;
+        }
+    }
+
+    /// Borrow bitstate work/visited buffers, growing each to a high-water mark
+    /// and reslicing to the lengths this call needs. `visited` is a per-run set
+    /// and is zeroed by the caller every run; only its allocation is reused.
+    fn bitBufs(self: *Scratch, ncap: usize, visited_size: usize) !struct { work: []i64, visited: []u32 } {
+        const a = self.allocator;
+        if (ncap > self.work.len) {
+            if (self.work.len > 0) a.free(self.work);
+            self.work = try a.alloc(i64, ncap);
+        }
+        if (visited_size > self.visited.len) {
+            if (self.visited.len > 0) a.free(self.visited);
+            self.visited = try a.alloc(u32, visited_size);
+        }
+        return .{ .work = self.work[0..ncap], .visited = self.visited[0..visited_size] };
+    }
+
+    /// A scratch-owned result buffer of length `n`, grown to a high-water mark.
+    /// The returned slice is valid only until the next call that reuses this
+    /// scratch — see `regexp.findSubmatchIndexScratch`.
+    pub fn resultBuf(self: *Scratch, n: usize) ![]i64 {
+        if (n > self.result.len) {
+            if (self.result.len > 0) self.allocator.free(self.result);
+            self.result = try self.allocator.alloc(i64, n);
+        }
+        return self.result[0..n];
+    }
+};
+
+const Machine = struct {
+    scratch: *Scratch,
     p: *const Prog,
     longest: bool,
     cond: EmptyOp,
@@ -142,13 +257,19 @@ const Machine = struct {
     prefix_rune: i32,
     q0: Queue,
     q1: Queue,
-    pool: std.ArrayList(*Thread) = .empty,
-    all_threads: std.ArrayList(*Thread) = .empty,
     matched: bool = false,
     matchcap: []i64,
 
-    fn init(allocator: std.mem.Allocator, p: *const Prog, longest: bool, cond: EmptyOp, prefix: []const u8, ncap: usize) !Machine {
+    /// Build a Machine view over `scratch`. Buffers are borrowed from `scratch`
+    /// (grown as needed); nothing here is freed at the end of a run — the
+    /// scratch outlives the Machine. Sparse sets are deliberately NOT zeroed:
+    /// the membership test in `add` is `sp < q.n and dense[sp].pc == pc`, which
+    /// the dense cross-check makes sound against any stale/indeterminate
+    /// `sparse[pc]` (the defining property of a sparse set — Go zeroes the
+    /// buffer only because `make` does, never for correctness).
+    fn init(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, prefix: []const u8, ncap: usize) !Machine {
         const ninst = p.insts.len;
+        try scratch.ensurePike(ninst, ncap);
         var prune: i32 = -1;
         if (prefix.len > 0) {
             const n = std.unicode.utf8ByteSequenceLength(prefix[0]) catch 1;
@@ -157,58 +278,38 @@ const Machine = struct {
             else
                 0xFFFD;
         }
-        // The sparse-set membership check reads sparse[pc] before it is written;
-        // its correctness relies only on the dense cross-check, but Go's `make`
-        // zero-initializes, so we do too to avoid reading indeterminate memory.
-        const s0 = try allocator.alloc(u32, ninst);
-        @memset(s0, 0);
-        const s1 = try allocator.alloc(u32, ninst);
-        @memset(s1, 0);
         return .{
-            .allocator = allocator,
+            .scratch = scratch,
             .p = p,
             .longest = longest,
             .cond = cond,
             .ncap = ncap,
             .prefix = prefix,
             .prefix_rune = prune,
-            .q0 = .{ .sparse = s0, .dense = try allocator.alloc(Entry, ninst) },
-            .q1 = .{ .sparse = s1, .dense = try allocator.alloc(Entry, ninst) },
-            .matchcap = try allocator.alloc(i64, ncap),
+            .q0 = .{ .sparse = scratch.s0, .dense = scratch.dense0 },
+            .q1 = .{ .sparse = scratch.s1, .dense = scratch.dense1 },
+            .matchcap = scratch.matchcap,
         };
     }
 
-    fn deinit(m: *Machine) void {
-        for (m.all_threads.items) |t| {
-            m.allocator.free(t.cap);
-            m.allocator.destroy(t);
-        }
-        m.all_threads.deinit(m.allocator);
-        m.pool.deinit(m.allocator);
-        m.allocator.free(m.q0.sparse);
-        m.allocator.free(m.q0.dense);
-        m.allocator.free(m.q1.sparse);
-        m.allocator.free(m.q1.dense);
-        m.allocator.free(m.matchcap);
-    }
-
     fn alloc(m: *Machine, pc: u32) !*Thread {
-        if (m.pool.items.len > 0) {
-            const t = m.pool.pop().?;
+        const sc = m.scratch;
+        if (sc.pool.items.len > 0) {
+            const t = sc.pool.pop().?;
             t.pc = pc;
             return t;
         }
-        const t = try m.allocator.create(Thread);
-        t.cap = try m.allocator.alloc(i64, m.ncap);
+        const t = try sc.allocator.create(Thread);
+        t.cap = if (m.ncap > 0) try sc.allocator.alloc(i64, m.ncap) else &.{};
         t.pc = pc;
-        try m.all_threads.append(m.allocator, t);
+        try sc.all_threads.append(sc.allocator, t);
         // Ensure the free pool can always hold every thread without erroring.
-        try m.pool.ensureTotalCapacity(m.allocator, m.all_threads.items.len);
+        try sc.pool.ensureTotalCapacity(sc.allocator, sc.all_threads.items.len);
         return t;
     }
 
     inline fn free(m: *Machine, t: *Thread) void {
-        m.pool.appendAssumeCapacity(t);
+        m.scratch.pool.appendAssumeCapacity(t);
     }
 
     fn clearQueue(m: *Machine, q: *Queue) void {
@@ -417,7 +518,7 @@ const BitState = struct {
     end: usize,
     cap: []i64, // working capture registers
     matchcap: []i64, // best match captures (the result)
-    jobs: std.ArrayList(Job) = .empty,
+    jobs: *std.ArrayList(Job), // borrowed from Scratch, reused across calls
     visited: []u32,
 
     fn shouldVisit(b: *BitState, pc: u32, pos: i64) bool {
@@ -541,7 +642,7 @@ const BitState = struct {
     }
 };
 
-fn backtrack(allocator: std.mem.Allocator, p: *const Prog, longest: bool, cond: EmptyOp, prefix: []const u8, input: Input, pos: usize, caps: []i64) !bool {
+fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, prefix: []const u8, input: Input, pos: usize, caps: []i64) !bool {
     if (cond == prog.impossible) return false;
     if (cond & prog.empty_begin_text != 0 and pos != 0) return false;
 
@@ -549,16 +650,18 @@ fn backtrack(allocator: std.mem.Allocator, p: *const Prog, longest: bool, cond: 
     const end = input.s.len;
     const visited_size = (ninst * (end + 1) + visited_bits - 1) / visited_bits;
 
-    const work = try allocator.alloc(i64, caps.len);
-    defer allocator.free(work);
-    const visited = try allocator.alloc(u32, visited_size);
-    defer allocator.free(visited);
+    // Reuse work/visited from the scratch; only the allocation is amortised —
+    // both are reset below, so no stale state carries between calls.
+    const bufs = try scratch.bitBufs(caps.len, visited_size);
+    const work = bufs.work;
+    const visited = bufs.visited;
     @memset(work, -1);
     @memset(caps, -1);
     @memset(visited, 0);
 
+    scratch.jobs.clearRetainingCapacity();
     var b = BitState{
-        .allocator = allocator,
+        .allocator = scratch.allocator,
         .p = p,
         .input = input,
         .longest = longest,
@@ -566,8 +669,8 @@ fn backtrack(allocator: std.mem.Allocator, p: *const Prog, longest: bool, cond: 
         .cap = work,
         .matchcap = caps,
         .visited = visited,
+        .jobs = &scratch.jobs,
     };
-    defer b.jobs.deinit(allocator);
 
     if (cond & prog.empty_begin_text != 0) {
         if (b.cap.len > 0) b.cap[0] = @intCast(pos);
@@ -669,8 +772,12 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, input: Input, pos0: usize, c
 ///
 /// Dispatches like Go: the one-pass engine if the regexp qualifies, else the
 /// bitstate backtracker for small programs/inputs, else the Pike VM.
-pub fn execute(
-    allocator: std.mem.Allocator,
+///
+/// Reuse variant: borrows all engine storage from `scratch`, so a steady-state
+/// loop over one compiled program allocates nothing. The one-pass path never
+/// allocated and ignores the scratch.
+pub fn executeReuse(
+    scratch: *Scratch,
     p: *const Prog,
     op: ?*const OnePassProg,
     longest: bool,
@@ -683,11 +790,30 @@ pub fn execute(
     if (op) |onep| return doOnePass(onep, cond, input, pos, caps);
     const ninst = p.insts.len;
     if (ninst <= max_backtrack_prog and ninst > 0 and input.s.len < max_backtrack_vector / ninst) {
-        return backtrack(allocator, p, longest, cond, prefix, input, pos, caps);
+        return backtrack(scratch, p, longest, cond, prefix, input, pos, caps);
     }
-    var m = try Machine.init(allocator, p, longest, cond, prefix, caps.len);
-    defer m.deinit();
+    var m = try Machine.init(scratch, p, longest, cond, prefix, caps.len);
     if (!try m.run(input, pos)) return false;
     @memcpy(caps, m.matchcap);
     return true;
+}
+
+/// Allocating variant: the existing public entry point. Wraps `executeReuse`
+/// with a temporary scratch, so each call allocates and frees its engine
+/// storage exactly as before — and the differential suite (which routes through
+/// here) validates the shared `executeReuse` code path.
+pub fn execute(
+    allocator: std.mem.Allocator,
+    p: *const Prog,
+    op: ?*const OnePassProg,
+    longest: bool,
+    cond: EmptyOp,
+    prefix: []const u8,
+    input: Input,
+    pos: usize,
+    caps: []i64,
+) !bool {
+    var scratch = Scratch.init(allocator);
+    defer scratch.deinit();
+    return executeReuse(&scratch, p, op, longest, cond, prefix, input, pos, caps);
 }

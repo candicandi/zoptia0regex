@@ -8,6 +8,7 @@ const regexp = @import("regexp.zig");
 
 pub const Regexp = regexp.Regexp;
 pub const Match = regexp.Match;
+pub const Scratch = regexp.Scratch;
 pub const ParseError = regexp.ParseError;
 pub const ExecError = regexp.ExecError;
 

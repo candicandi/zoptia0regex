@@ -300,6 +300,56 @@ test "one-pass engine on anchored patterns" {
     }
 }
 
+test "scratch reuse carries no stale state across patterns" {
+    var scratch = regex.Scratch.init(ta);
+    defer scratch.deinit();
+
+    const Case = struct { p: []const u8, in: []const u8 };
+    // One reused scratch, six different patterns (literal/alternation → bitstate,
+    // anchored → one-pass, larger → Pike VM) interleaving match / no-match /
+    // match. Each result must equal a fresh allocating re.match, proving the
+    // reused queues, thread pool and sparse sets carry no state between calls.
+    const cases = [_]Case{
+        .{ .p = "abc", .in = "xabcy" }, // match
+        .{ .p = "abc", .in = "ab" }, // NO match
+        .{ .p = "a(b|c)d", .in = "acd" }, // match (alternation)
+        .{ .p = "\\A\\d+\\z", .in = "12a45" }, // NO match (one-pass)
+        .{ .p = "\\A[a-z]+@[a-z]+\\z", .in = "user@host" }, // match (one-pass)
+        .{ .p = "(foo|bar|baz)+", .in = "zzbarfoozz" }, // match
+    };
+    for (cases) |c| {
+        var re = try regex.compile(ta, c.p);
+        defer re.deinit();
+        const want = try re.match(ta, c.in); // fresh, allocating reference
+        try std.testing.expectEqual(want, try re.matchScratch(&scratch, c.in));
+        // Repeat to prove steady-state reuse stays stable.
+        try std.testing.expectEqual(want, try re.matchScratch(&scratch, c.in));
+        try std.testing.expectEqual(want, try re.matchScratch(&scratch, c.in));
+    }
+
+    // The same scratch now drives submatch extraction (ncap grows from 0): the
+    // borrowed result must match the allocating findSubmatchIndex every time.
+    const subcases = [_]Case{
+        .{ .p = "(\\w+)@(\\w+)", .in = "me@host" },
+        .{ .p = "(\\w+)@(\\w+)", .in = "nope" }, // NO match
+        .{ .p = "(a+)(b+)", .in = "aaabb" },
+        .{ .p = "(\\w+)@(\\w+)", .in = "x@y" },
+    };
+    for (subcases) |c| {
+        var re = try regex.compile(ta, c.p);
+        defer re.deinit();
+        const want = try re.findSubmatchIndex(ta, c.in);
+        defer if (want) |w| ta.free(w);
+        const got = try re.findSubmatchIndexScratch(&scratch, c.in);
+        if (want) |w| {
+            try std.testing.expect(got != null);
+            try std.testing.expectEqualSlices(i64, w, got.?);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+}
+
 test "replace func" {
     var re = try regex.compile(ta, "\\d+");
     defer re.deinit();
