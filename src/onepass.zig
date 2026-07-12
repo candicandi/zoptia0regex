@@ -36,6 +36,46 @@ pub const OnePassProg = struct {
 
 const merge_failed: u32 = 0xffffffff;
 
+pub const Prefix = struct { str: []const u8, complete: bool, pc: u32 };
+
+/// A literal string that all matches for the (begin-anchored) one-pass regexp
+/// must start with, whether that prefix is the entire match, and the pc to
+/// resume execution at once the prefix has been consumed. Unlike
+/// `Prog.prefix`, the walk never crosses a capture instruction, so `doOnePass`
+/// can jump straight to `pc` without losing recorded submatches. Mirrors Go's
+/// `onePassPrefix`.
+pub fn onePassPrefix(al: std.mem.Allocator, p: *const Prog) !Prefix {
+    var i = &p.insts[p.start];
+    if (i.op != .empty_width or (@as(prog.EmptyOp, @intCast(i.arg)) & prog.empty_begin_text) == 0) {
+        return .{ .str = "", .complete = i.op == .match, .pc = p.start };
+    }
+    var pc = i.out;
+    i = &p.insts[pc];
+    while (i.op == .nop) {
+        pc = i.out;
+        i = &p.insts[pc];
+    }
+    // Avoid building when there is no single-rune prefix.
+    if (prog.mergedOp(i.op) != .rune or i.runes.len != 1) {
+        return .{ .str = "", .complete = i.op == .match, .pc = p.start };
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(al);
+    while (prog.mergedOp(i.op) == .rune and i.runes.len == 1 and
+        (@as(ast.Flags, @intCast(i.arg)) & ast.FoldCase) == 0 and i.runes[0] != 0xFFFD)
+    {
+        var tmp: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(i.runes[0], &tmp) catch break;
+        try buf.appendSlice(al, tmp[0..n]);
+        pc = i.out;
+        i = &p.insts[pc];
+    }
+    const complete = i.op == .empty_width and
+        (@as(prog.EmptyOp, @intCast(i.arg)) & prog.empty_end_text) != 0 and
+        p.insts[i.out].op == .match;
+    return .{ .str = try buf.toOwnedSlice(al), .complete = complete, .pc = pc };
+}
+
 /// Select the next pc from an Alt/AltMatch instruction based on the input rune.
 /// Mirrors Go's `onePassNext`.
 pub fn onePassNext(inst: *const OnePassInst, r: i32) u32 {
@@ -272,6 +312,48 @@ fn onePassCopy(al: std.mem.Allocator, p: *const Prog) !OnePassProg {
     const insts = try al.alloc(OnePassInst, p.insts.len);
     for (p.insts, 0..) |inst, i| {
         insts[i] = .{ .op = inst.op, .out = inst.out, .arg = inst.arg, .runes = inst.runes };
+    }
+
+    // Rewrite one or more common Prog constructs that enable some otherwise
+    // non-onepass Progs to be onepass (Go's onePassCopy). "A:BC" means an Alt
+    // at pc A that points to pcs B and C:
+    //   A:BC + B:DA => A:BC + B:DC   (simple empty-transition loop)
+    //   A:BC + B:DC => A:DC + B:DC   (empty transition to common target)
+    for (0..insts.len) |pc| {
+        switch (insts[pc].op) {
+            .alt, .alt_match => {},
+            else => continue,
+        }
+        // A:Bx + B:Ay
+        var p_a_other = &insts[pc].out;
+        var p_a_alt = &insts[pc].arg;
+        // make sure a target is another Alt
+        var inst_alt = insts[p_a_alt.*];
+        if (!(inst_alt.op == .alt or inst_alt.op == .alt_match)) {
+            const t = p_a_alt;
+            p_a_alt = p_a_other;
+            p_a_other = t;
+            inst_alt = insts[p_a_alt.*];
+            if (!(inst_alt.op == .alt or inst_alt.op == .alt_match)) continue;
+        }
+        const inst_other = insts[p_a_other.*];
+        // Analyzing both legs pointing to Alts is for another day.
+        if (inst_other.op == .alt or inst_other.op == .alt_match) continue;
+        // simple empty transition loop: A:BC + B:DA => A:BC + B:DC
+        var p_b_alt = &insts[p_a_alt.*].out;
+        var p_b_other = &insts[p_a_alt.*].arg;
+        var patch = false;
+        if (inst_alt.out == @as(u32, @intCast(pc))) {
+            patch = true;
+        } else if (inst_alt.arg == @as(u32, @intCast(pc))) {
+            patch = true;
+            const t = p_b_alt;
+            p_b_alt = p_b_other;
+            p_b_other = t;
+        }
+        if (patch) p_b_alt.* = p_a_other.*;
+        // empty transition to common target: A:BC + B:DC => A:DC + B:DC
+        if (p_a_other.* == p_b_alt.*) p_a_alt.* = p_b_other.*;
     }
     return .{ .insts = insts, .start = p.start, .num_cap = p.num_cap };
 }

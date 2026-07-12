@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Performance
+
+Five behaviour-neutral engine optimizations (all ~30k differential cases still
+byte-for-byte identical to Go). New benchmark geomean vs Go: **0.73×**
+(was 0.887×); details in BENCHMARKS.md.
+
+- **First-byte prefilter (no Go counterpart).** When a pattern has no literal
+  prefix but can only start with ≤ 4 ASCII bytes (case-insensitive literal,
+  small leading class, alternation of such), the Pike VM and bitstate engines
+  skip ahead with a vectorized byte scan. Disabled whenever it could be unsafe
+  (nullable patterns, non-ASCII starts, case-fold cycles that leave ASCII such
+  as `(?i)k` ↔ U+212A). Unanchored `(?i)performance` over 256 KB: 1.29× vs Go
+  → **0.28×** (3.5× faster than Go); alternation scan 0.81× → **0.37×**.
+- **ASCII fast path in the rune decoder** (`Input.step`), a few percent on
+  every engine and ~35–50% on short anchored one-pass matches.
+- **One-pass literal-prefix skip** (ports Go's `onePassPrefix` / `doOnePass`
+  skip): anchored patterns with a literal head check it with one `startsWith`
+  and resume past its instructions. Also fixes `literalPrefix()` for one-pass
+  regexps to match Go's (capture-safe) prefix.
+- **`onePassCopy` Prog-idiom rewrites** (ports the previously-omitted Go
+  pass): more anchored patterns qualify for the one-pass engine.
+- **Rabin-Karp fallback in `prefixIndex`** (mirrors Go's `bytes.Index`):
+  the literal-prefix scan is now worst-case linear instead of O(n·m) on
+  periodic inputs.
+
 ### Added
 
 - `findIndexScratch`: the `findIndex` companion to `matchScratch` /

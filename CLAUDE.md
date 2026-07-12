@@ -62,11 +62,21 @@ three engines.
 
 **Three execution engines, dispatched in `exec.zig:execute()` exactly as Go
 does** (`onepass != null` → one-pass; small prog+input → bitstate; else Pike VM),
-all sharing literal-prefix acceleration (`prefixIndex`, a vectorized first-byte
-scan). All three must produce identical results; the differential suite routes
-anchored patterns through one-pass and small ones through bitstate, so it tests
-all of them. Match semantics: leftmost-first (`compile`) vs POSIX
-leftmost-longest (`compilePOSIX` / `setLongest`).
+all sharing the compile-time acceleration data in `exec.Accel`: a literal
+prefix (`prefixIndex` — vectorized first-byte scan with a Rabin-Karp fallback,
+like Go's `bytes.Index`; for one-pass regexps `onePassPrefix` also yields the
+pc to resume at after the prefix), and — a port-specific addition with no Go
+counterpart — a `first_bytes` set (`regexp.zig:firstBytes`): when there is no
+literal prefix, a ≤4-byte ASCII set of possible match-start bytes that the
+Pike VM / bitstate engines skip ahead to (this is what makes unanchored `(?i)`
+literals fast). `first_bytes` must stay a *superset* of the true start bytes —
+e.g. it is disabled when a case-fold cycle leaves ASCII (`(?i)k` matches
+U+212A) — and the Pike VM must recompute the boundary `flag` after a
+first-bytes skip (`\b` before the first rune). All three engines must produce
+identical results; the differential suite routes anchored patterns through
+one-pass and small ones through bitstate, so it tests all of them. Match
+semantics: leftmost-first (`compile`) vs POSIX leftmost-longest
+(`compilePOSIX` / `setLongest`).
 
 **Subtle invariants to preserve when editing the engine/compiler:**
 - Greedy vs non-greedy is encoded purely by the **order of an `alt`
@@ -102,9 +112,13 @@ runs under `std.testing.allocator`, so any leak fails the build.
 ## Intentional omissions — do not "fix" these
 
 These diverge from Go's *source* but never from its *results*: the alternation
-`factor()` pass, `onePassCopy`'s Prog-idiom rewrites, and `doOnePass`'s
-literal-prefix skip are omitted (they only change which engine qualifies / raw
+`factor()` pass is omitted (it only changes the compiled program's shape / raw
 speed). The `\p{...}` table set is a **curated subset** (unknown names →
 `error.InvalidCharRange`). Backreferences and `\C` are unsupported — **same as
 Go** (RE2). Inputs are `[]const u8` only (no `io.RuneReader`). See the README
 "Scope" table.
+
+(Once also omitted, now ported: `onePassCopy`'s Prog-idiom rewrites and
+`doOnePass`'s literal-prefix skip. The port also *adds* one accelerator Go
+lacks: the `first_bytes` prefilter described above — behaviour-neutral by
+construction and covered by the differential suite.)

@@ -40,6 +40,8 @@ pub const Regexp = struct {
     longest: bool,
     prefix: []const u8,
     prefix_complete: bool,
+    prefix_end: u32,
+    first_bytes: []const u8,
     onepass: ?*onepass.OnePassProg,
 
     pub fn deinit(re: *Regexp) void {
@@ -58,13 +60,17 @@ pub const Regexp = struct {
     /// Run the engines over `input` starting at `pos` with a per-call scratch.
     /// `caps` receives the submatch offsets (its length bounds how many are
     /// recorded); returns whether a match was found.
+    fn accel(re: *const Regexp) exec.Accel {
+        return .{ .prefix = re.prefix, .prefix_end = re.prefix_end, .first_bytes = re.first_bytes };
+    }
+
     fn execAt(re: *const Regexp, allocator: std.mem.Allocator, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
-        return exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, input, pos, caps);
+        return exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.accel(), input, pos, caps);
     }
 
     /// `execAt` borrowing all engine storage from a caller-owned `Scratch`.
     fn execAtScratch(re: *const Regexp, scratch: *Scratch, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
-        return exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.prefix, input, pos, caps);
+        return exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.accel(), input, pos, caps);
     }
 
     // --- introspection ---
@@ -534,8 +540,8 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     const simplified = try simplify.simplify(al, re_ast);
     const p = try compile_.compile(al, simplified);
 
-    const pfx = try p.prefix(al);
     const expr_owned = try al.dupe(u8, expr);
+    const cond = p.startCond();
 
     // Build the one-pass program if the regexp qualifies (anchored, unambiguous).
     const op_prog: ?*onepass.OnePassProg = blk: {
@@ -547,6 +553,32 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         break :blk null;
     };
 
+    // Like Go: one-pass regexps use onePassPrefix (which also yields the pc to
+    // resume at after the prefix); everything else uses Prog.prefix.
+    var prefix_str: []const u8 = "";
+    var prefix_complete = false;
+    var prefix_end: u32 = 0;
+    if (op_prog != null) {
+        const opfx = try onepass.onePassPrefix(al, &p);
+        prefix_str = opfx.str;
+        prefix_complete = opfx.complete;
+        prefix_end = opfx.pc;
+    } else {
+        const pfx = try p.prefix(al);
+        prefix_str = pfx.str;
+        prefix_complete = pfx.complete;
+    }
+
+    // With no literal prefix, a small set of possible first bytes still lets
+    // the Pike VM / bitstate engines skip ahead (see exec.Accel.first_bytes).
+    // Anchored programs never scan, and one-pass never uses it.
+    var first_bytes: []const u8 = "";
+    if (op_prog == null and prefix_str.len == 0 and
+        cond != prog.impossible and (cond & prog.empty_begin_text) == 0)
+    {
+        if (try firstBytes(gpa, al, &p)) |fb| first_bytes = fb;
+    }
+
     return Regexp{
         .base_allocator = gpa,
         .arena = arena,
@@ -554,13 +586,92 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .prog = p,
         .num_subexp = @intCast(max_cap),
         .subexp_names = names,
-        .cond = p.startCond(),
+        .cond = cond,
         .min_input_len = minInputLen(simplified),
         .longest = longest,
-        .prefix = pfx.str,
-        .prefix_complete = pfx.complete,
+        .prefix = prefix_str,
+        .prefix_complete = prefix_complete,
+        .prefix_end = prefix_end,
+        .first_bytes = first_bytes,
         .onepass = op_prog,
     };
+}
+
+/// Max size of the accelerated first-byte set; a wider set filters too little
+/// to pay for the scan.
+const max_first_bytes = 4;
+
+/// The set of bytes that can begin a match, computed from the epsilon-closure
+/// of the program start. Returns null (no acceleration) when the pattern can
+/// match empty, can start with a non-ASCII rune or a wide class, or when a
+/// case-fold cycle leaves ASCII (e.g. `(?i)k` also matches U+212A). Every
+/// zero-width assertion is treated as satisfiable, so the set is a superset of
+/// the true first bytes — skipping other bytes can never skip a match.
+fn firstBytes(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const prog.Prog) !?[]const u8 {
+    const seen = try gpa.alloc(bool, p.insts.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(gpa);
+    var set = [_]bool{false} ** 0x80;
+
+    try stack.append(gpa, p.start);
+    while (stack.pop()) |pc| {
+        if (seen[pc]) continue;
+        seen[pc] = true;
+        const i = &p.insts[pc];
+        switch (i.op) {
+            .fail => {},
+            .match => return null, // matches empty: every position is viable
+            .nop, .capture, .empty_width => try stack.append(gpa, i.out),
+            .alt, .alt_match => {
+                try stack.append(gpa, i.out);
+                try stack.append(gpa, i.arg);
+            },
+            .rune_any, .rune_any_not_nl => return null,
+            .rune1 => {
+                // The engines compare rune1 against runes[0] directly (no
+                // folding), so only that rune can begin the match here.
+                if (i.runes[0] >= 0x80) return null;
+                set[i.runes[0]] = true;
+            },
+            .rune => {
+                if (i.runes.len == 0) continue; // matches nothing
+                if (i.runes.len == 1) {
+                    // Single rune; FoldCase makes it match its whole fold cycle.
+                    const r0 = i.runes[0];
+                    if (r0 >= 0x80) return null;
+                    set[r0] = true;
+                    if ((@as(ast.Flags, @intCast(i.arg)) & ast.FoldCase) != 0) {
+                        var r1 = unicode.simpleFold(r0);
+                        while (r1 != r0) : (r1 = unicode.simpleFold(r1)) {
+                            if (r1 >= 0x80) return null;
+                            set[r1] = true;
+                        }
+                    }
+                } else {
+                    var j: usize = 0;
+                    while (j < i.runes.len) : (j += 2) {
+                        const hi = i.runes[j + 1];
+                        if (hi >= 0x80) return null;
+                        var b = i.runes[j];
+                        while (b <= hi) : (b += 1) set[b] = true;
+                    }
+                }
+            },
+        }
+    }
+
+    var buf: [max_first_bytes]u8 = undefined;
+    var n: usize = 0;
+    for (set, 0..) |on, b| {
+        if (!on) continue;
+        if (n == max_first_bytes) return null;
+        buf[n] = @intCast(b);
+        n += 1;
+    }
+    if (n == 0) return null;
+    return try al.dupe(u8, buf[0..n]);
 }
 
 /// Compile `expr` with Perl (leftmost-first) semantics.

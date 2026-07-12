@@ -22,6 +22,28 @@ const OnePassProg = onepass.OnePassProg;
 
 const end_of_text: i32 = -1;
 
+/// Match-acceleration data computed at compile time (see `regexp.compileInternal`).
+pub const Accel = struct {
+    /// Literal string every match must start with ("" = none). For one-pass
+    /// regexps this is Go's `onePassPrefix`; otherwise `Prog.prefix`.
+    prefix: []const u8 = "",
+    /// One-pass only: the pc to resume at after `prefix` has been consumed.
+    prefix_end: u32 = 0,
+    /// When `prefix` is empty: the (ASCII) bytes a match can start with, or
+    /// empty when no such small set exists. A superset of the true first
+    /// bytes, so skipping to the next occurrence can never skip a match.
+    first_bytes: []const u8 = "",
+};
+
+fn inFirstBytes(set: []const u8, r: i32) bool {
+    if (r < 0 or r > 0x7F) return false;
+    const b: u8 = @intCast(r);
+    for (set) |x| {
+        if (x == b) return true;
+    }
+    return false;
+}
+
 /// A lazily-evaluated pair of boundary runes, for checking zero-width
 /// assertions. Mirrors Go's `lazyFlag`.
 pub const LazyFlag = struct {
@@ -76,6 +98,7 @@ pub const Input = struct {
     pub fn step(self: Input, pos: usize) Step {
         if (pos >= self.s.len) return .{ .r = end_of_text, .w = 0 };
         const b = self.s[pos];
+        if (b < 0x80) return .{ .r = b, .w = 1 }; // ASCII fast path
         const n = std.unicode.utf8ByteSequenceLength(b) catch return .{ .r = 0xFFFD, .w = 1 };
         if (pos + n > self.s.len) return .{ .r = 0xFFFD, .w = 1 };
         const r = std.unicode.utf8Decode(self.s[pos .. pos + n]) catch return .{ .r = 0xFFFD, .w = 1 };
@@ -93,18 +116,54 @@ pub const Input = struct {
 
 /// Find the first occurrence of `needle` in `haystack`. Like Go's bytes.Index,
 /// it scans for the first byte with a vectorized search (`indexOfScalar`) and
-/// verifies the rest, which is much faster than a generic substring search for
-/// the common "rare first byte" case.
+/// verifies the rest — much faster than a generic substring search for the
+/// common "rare first byte" case — and, like Go, switches to Rabin-Karp when
+/// the first byte produces too many false starts (a periodic needle over a
+/// periodic haystack is otherwise O(n·m)).
 fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
     var start: usize = 0;
+    var fails: usize = 0;
     while (start + needle.len <= haystack.len) {
         const rel = std.mem.indexOfScalar(u8, haystack[start..], needle[0]) orelse return null;
         const at = start + rel;
         if (at + needle.len > haystack.len) return null;
         if (std.mem.eql(u8, haystack[at .. at + needle.len], needle)) return at;
         start = at + 1;
+        fails += 1;
+        if (fails > (at + 16) / 8) { // Go's bytes.Index cutover shape
+            if (indexRabinKarp(haystack[start..], needle)) |j| return start + j;
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Rabin-Karp substring search, mirroring Go's `internal/bytealg`: worst-case
+/// linear, used as `prefixIndex`'s fallback for pathological inputs.
+fn indexRabinKarp(s: []const u8, sep: []const u8) ?usize {
+    if (s.len < sep.len) return null;
+    const prime_rk: u32 = 16777619;
+    var hashsep: u32 = 0;
+    for (sep) |b| hashsep = hashsep *% prime_rk +% b;
+    var pow: u32 = 1;
+    var sq: u32 = prime_rk;
+    var i = sep.len;
+    while (i > 0) : (i >>= 1) {
+        if (i & 1 != 0) pow *%= sq;
+        sq *%= sq;
+    }
+    var h: u32 = 0;
+    for (s[0..sep.len]) |b| h = h *% prime_rk +% b;
+    if (h == hashsep and std.mem.eql(u8, s[0..sep.len], sep)) return 0;
+    var j = sep.len;
+    while (j < s.len) {
+        h *%= prime_rk;
+        h +%= s[j];
+        h -%= pow *% s[j - sep.len];
+        j += 1;
+        if (h == hashsep and std.mem.eql(u8, s[j - sep.len .. j], sep)) return j - sep.len;
     }
     return null;
 }
@@ -255,7 +314,7 @@ const Machine = struct {
     longest: bool,
     cond: EmptyOp,
     ncap: usize,
-    prefix: []const u8,
+    accel: Accel,
     prefix_rune: i32,
     q0: Queue,
     q1: Queue,
@@ -269,10 +328,11 @@ const Machine = struct {
     /// the dense cross-check makes sound against any stale/indeterminate
     /// `sparse[pc]` (the defining property of a sparse set — Go zeroes the
     /// buffer only because `make` does, never for correctness).
-    fn init(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, prefix: []const u8, ncap: usize) !Machine {
+    fn init(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, accel: Accel, ncap: usize) !Machine {
         const ninst = p.insts.len;
         try scratch.ensurePike(ninst, ncap);
         var prune: i32 = -1;
+        const prefix = accel.prefix;
         if (prefix.len > 0) {
             const n = std.unicode.utf8ByteSequenceLength(prefix[0]) catch 1;
             prune = if (n <= prefix.len)
@@ -286,7 +346,7 @@ const Machine = struct {
             .longest = longest,
             .cond = cond,
             .ncap = ncap,
-            .prefix = prefix,
+            .accel = accel,
             .prefix_rune = prune,
             .q0 = .{ .sparse = scratch.s0, .dense = scratch.dense0 },
             .q1 = .{ .sparse = scratch.s1, .dense = scratch.dense1 },
@@ -462,8 +522,8 @@ const Machine = struct {
                 // Literal-prefix acceleration: every match must start with the
                 // prefix, so fast-forward to its next occurrence (memchr-class
                 // substring search) instead of stepping the NFA at every byte.
-                if (m.prefix.len > 0 and r1 != m.prefix_rune and pos <= input.s.len) {
-                    if (prefixIndex(input.s[pos..], m.prefix)) |adv| {
+                if (m.accel.prefix.len > 0 and r1 != m.prefix_rune and pos <= input.s.len) {
+                    if (prefixIndex(input.s[pos..], m.accel.prefix)) |adv| {
                         pos += adv;
                         const sa = input.step(pos);
                         r = sa.r;
@@ -471,6 +531,25 @@ const Machine = struct {
                         const sb = input.step(pos + width);
                         r1 = sb.r;
                         width1 = sb.w;
+                    } else break;
+                } else if (m.accel.first_bytes.len > 0 and !inFirstBytes(m.accel.first_bytes, r) and pos <= input.s.len) {
+                    // First-byte acceleration: no literal prefix, but every
+                    // match starts with one of a few ASCII bytes (e.g. a
+                    // case-insensitive literal or a small leading class), so
+                    // scan ahead to the next candidate. Unlike the prefix
+                    // path, the closure may pass zero-width assertions, so
+                    // the boundary flag must be recomputed for the new pos.
+                    if (std.mem.indexOfAny(u8, input.s[pos..], m.accel.first_bytes)) |adv| {
+                        if (adv > 0) {
+                            pos += adv;
+                            const sa = input.step(pos);
+                            r = sa.r;
+                            width = sa.w;
+                            const sb = input.step(pos + width);
+                            r1 = sb.r;
+                            width1 = sb.w;
+                            flag = input.context(pos);
+                        }
                     } else break;
                 }
             }
@@ -644,7 +723,7 @@ const BitState = struct {
     }
 };
 
-fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, prefix: []const u8, input: Input, pos: usize, caps: []i64) !bool {
+fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, accel: Accel, input: Input, pos: usize, caps: []i64) !bool {
     if (cond == prog.impossible) return false;
     if (cond & prog.empty_begin_text != 0 and pos != 0) return false;
 
@@ -685,8 +764,13 @@ fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, pr
     var width: i64 = -1;
     const end_i: i64 = @intCast(end);
     while (p_pos <= end_i and width != 0) {
-        if (prefix.len > 0) {
-            const adv = prefixIndex(input.s[@intCast(p_pos)..], prefix) orelse return false;
+        if (accel.prefix.len > 0) {
+            const adv = prefixIndex(input.s[@intCast(p_pos)..], accel.prefix) orelse return false;
+            p_pos += @intCast(adv);
+        } else if (accel.first_bytes.len > 0) {
+            // No literal prefix, but every match starts with one of a few
+            // ASCII bytes: jump to the next candidate start.
+            const adv = std.mem.indexOfAny(u8, input.s[@intCast(p_pos)..], accel.first_bytes) orelse return false;
             p_pos += @intCast(adv);
         }
         if (b.cap.len > 0) b.cap[0] = p_pos;
@@ -700,7 +784,7 @@ fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, pr
 /// The one-pass engine: a single deterministic pass following per-instruction
 /// `Next` dispatch tables. Used only for qualifying anchored regexps. Mirrors
 /// Go's `doOnePass`.
-fn doOnePass(op: *const OnePassProg, cond: EmptyOp, input: Input, pos0: usize, caps: []i64) bool {
+fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, pos0: usize, caps: []i64) bool {
     if (cond == prog.impossible) return false;
     var pos = pos0;
     for (caps) |*c| c.* = -1;
@@ -720,6 +804,22 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, input: Input, pos0: usize, c
     var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, r) else input.context(pos);
     var pc = op.start;
     var matched = false;
+
+    // If there is a simple literal prefix, skip over it and resume at
+    // `accel.prefix_end` (the prefix crosses no capture instructions, so no
+    // recorded state is lost). Mirrors Go's `doOnePass`.
+    if (pos == 0 and flag.match(@intCast(op.insts[pc].arg)) and accel.prefix.len > 0) {
+        if (!std.mem.startsWith(u8, input.s, accel.prefix)) return false;
+        pos += accel.prefix.len;
+        const sa = input.step(pos);
+        r = sa.r;
+        width = sa.w;
+        const sb = input.step(pos + width);
+        r1 = sb.r;
+        width1 = sb.w;
+        flag = input.context(pos);
+        pc = accel.prefix_end;
+    }
 
     loop: while (true) {
         const inst = &op.insts[pc];
@@ -784,17 +884,17 @@ pub fn executeReuse(
     op: ?*const OnePassProg,
     longest: bool,
     cond: EmptyOp,
-    prefix: []const u8,
+    accel: Accel,
     input: Input,
     pos: usize,
     caps: []i64,
 ) !bool {
-    if (op) |onep| return doOnePass(onep, cond, input, pos, caps);
+    if (op) |onep| return doOnePass(onep, cond, accel, input, pos, caps);
     const ninst = p.insts.len;
     if (ninst <= max_backtrack_prog and ninst > 0 and input.s.len < max_backtrack_vector / ninst) {
-        return backtrack(scratch, p, longest, cond, prefix, input, pos, caps);
+        return backtrack(scratch, p, longest, cond, accel, input, pos, caps);
     }
-    var m = try Machine.init(scratch, p, longest, cond, prefix, caps.len);
+    var m = try Machine.init(scratch, p, longest, cond, accel, caps.len);
     if (!try m.run(input, pos)) return false;
     @memcpy(caps, m.matchcap);
     return true;
@@ -819,6 +919,17 @@ test "prefixIndex finds first occurrence or null" {
     try expectEqual(@as(?usize, null), prefixIndex("ab", "abc")); // needle longer than haystack
 }
 
+test "prefixIndex Rabin-Karp fallback on periodic input" {
+    const expectEqual = std.testing.expectEqual;
+    // Every 'a' is a false start, so the cutover to Rabin-Karp fires.
+    const hay = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"; // 39 a's + b
+    try expectEqual(@as(?usize, 35), prefixIndex(hay, "aaaab"));
+    try expectEqual(@as(?usize, null), prefixIndex(hay[0..39], "aaaab"));
+    try expectEqual(@as(?usize, 0), indexRabinKarp("abcabd", "abc"));
+    try expectEqual(@as(?usize, 3), indexRabinKarp("abdabc", "abc"));
+    try expectEqual(@as(?usize, null), indexRabinKarp("ab", "abc"));
+}
+
 /// Allocating variant: the existing public entry point. Wraps `executeReuse`
 /// with a temporary scratch, so each call allocates and frees its engine
 /// storage exactly as before — and the differential suite (which routes through
@@ -829,12 +940,12 @@ pub fn execute(
     op: ?*const OnePassProg,
     longest: bool,
     cond: EmptyOp,
-    prefix: []const u8,
+    accel: Accel,
     input: Input,
     pos: usize,
     caps: []i64,
 ) !bool {
     var scratch = Scratch.init(allocator);
     defer scratch.deinit();
-    return executeReuse(&scratch, p, op, longest, cond, prefix, input, pos, caps);
+    return executeReuse(&scratch, p, op, longest, cond, accel, input, pos, caps);
 }

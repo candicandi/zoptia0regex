@@ -6,11 +6,11 @@ standard-library `regexp` it is modelled on. The two engines produce
 how fast they get there.
 
 **Headline:** across 20 representative workloads the Zig port is, on average,
-**~11% faster** (geomean Zig/Go = **0.887×**) and **~1.7× faster at compiling**.
-It now ships all three of Go's engines (Pike VM, bitstate backtracker,
-one-pass); after that, Go is faster on just one workload — an *unanchored*
-case-insensitive scan, where the difference is a Pike-VM constant factor, not a
-missing engine.
+**~27% faster** (geomean Zig/Go = **0.73×**) and **~1.6× faster at compiling**.
+It ships all three of Go's engines (Pike VM, bitstate backtracker, one-pass)
+plus a first-byte prefilter Go lacks; Go is now ahead on just one workload —
+a small-input bitstate case at 1.10×, with both sides in single-digit
+microseconds.
 
 ## Methodology
 
@@ -33,7 +33,12 @@ missing engine.
 - **Same engine selection.** The port mirrors Go's dispatch exactly: the
   **one-pass** engine for qualifying anchored regexps, the **bitstate**
   backtracker for small programs/inputs, and the **Pike VM** otherwise; all with
-  literal-prefix acceleration.
+  literal-prefix acceleration (with a Rabin-Karp fallback, like Go's
+  `bytes.Index`). On top of that the port adds a **first-byte prefilter** Go
+  does not have: when no literal prefix exists but every match starts with one
+  of ≤ 4 ASCII bytes (e.g. a case-insensitive literal), the unanchored engines
+  skip ahead to the next candidate byte. Results stay identical — the
+  differential suite proves it.
 
 > Checksums differ between the harnesses only because calibration runs a
 > different iteration count on each; the per-call results are identical (proven
@@ -56,64 +61,69 @@ and exercise the one-pass engine.
 
 | case | op | engine | Go ns/op | Zig ns/op | Zig/Go |
 |------|----|--------|---------:|----------:|-------:|
-| literal_hit | find | prefix+VM | 202 | 216 | 1.07× |
-| literal_miss | find | prefix+VM | 6,220 | 5,565 | **0.89×** |
-| alternation | findall | Pike VM | 9,316,380 | 7,549,869 | **0.81×** |
-| charclass_word | findall | Pike VM | 6,632,277 | 6,490,546 | 0.98× |
-| perl_word `\w+` | findall | Pike VM | 7,388,538 | 7,200,052 | 0.97× |
-| digits `\d+` | findall | Pike VM | 3,468,888 | 2,898,405 | **0.84×** |
-| date | findall | Pike VM | 3,377,914 | 2,905,793 | **0.86×** |
-| email | findall | Pike VM | 5,071,845 | 4,643,634 | **0.92×** |
-| email_submatch | submatch | Pike VM | 2,057 | 1,913 | **0.93×** |
-| anchored_multiline `(?m)^\w+` | findall | Pike VM | 2,098,332 | 1,870,095 | **0.89×** |
-| unicode_letters `\p{L}+` | findall | Pike VM | 8,291,419 | 7,397,660 | **0.89×** |
-| dotstar_greedy `p.*e` | find | Pike VM | 3,619 | 2,942 | **0.81×** |
-| redos_linear `(a+)+$` | match | bitstate | 8,175 | 9,149 | 1.12× |
-| nested_groups | findall | Pike VM | 9,114,121 | 8,941,124 | 0.98× |
-| caseins_literal `(?i)…` | findall | Pike VM | 3,602,468 | 4,644,940 | 1.29× |
-| anchored_caseins `\A(?i)…\z` | match | one-pass | 60 | 51 | **0.85×** |
-| anchored_word `\A[a-z]+\z` | match | one-pass | 95 | 61 | **0.64×** |
-| anchored_date `\A\d{4}-…\z` | match | one-pass | 52 | 41 | **0.79×** |
-| anchored_digits `\A\d+\z` | match | one-pass | 90 | 54 | **0.60×** |
-| anchored_email `\A(…)@(…)\z` | submatch | one-pass | 216 | 180 | **0.84×** |
-| **geomean** | | | | | **0.887×** |
+| literal_hit | find | prefix+VM | 199 | 199 | 1.00× |
+| literal_miss | find | prefix+VM | 6,036 | 5,510 | **0.91×** |
+| alternation | findall | first-bytes+VM | 8,980,479 | 3,364,123 | **0.37×** |
+| charclass_word | findall | Pike VM | 6,493,451 | 6,267,628 | 0.97× |
+| perl_word `\w+` | findall | Pike VM | 7,262,458 | 7,005,486 | 0.96× |
+| digits `\d+` | findall | Pike VM | 3,361,419 | 2,931,916 | **0.87×** |
+| date | findall | Pike VM | 3,386,609 | 2,748,166 | **0.81×** |
+| email | findall | Pike VM | 5,023,514 | 4,182,054 | **0.83×** |
+| email_submatch | submatch | Pike VM | 2,052 | 1,856 | **0.90×** |
+| anchored_multiline `(?m)^\w+` | findall | Pike VM | 2,066,581 | 1,694,697 | **0.82×** |
+| unicode_letters `\p{L}+` | findall | Pike VM | 7,970,695 | 7,076,904 | **0.89×** |
+| dotstar_greedy `p.*e` | find | first-bytes+VM | 3,709 | 2,629 | **0.71×** |
+| redos_linear `(a+)+$` | match | bitstate | 8,156 | 8,933 | 1.10× |
+| nested_groups | findall | Pike VM | 9,030,139 | 8,346,949 | **0.92×** |
+| caseins_literal `(?i)…` | findall | first-bytes+VM | 3,518,115 | 992,006 | **0.28×** |
+| anchored_caseins `\A(?i)…\z` | match | one-pass | 60 | 38 | **0.63×** |
+| anchored_word `\A[a-z]+\z` | match | one-pass | 96 | 46 | **0.48×** |
+| anchored_date `\A\d{4}-…\z` | match | one-pass | 52 | 31 | **0.59×** |
+| anchored_digits `\A\d+\z` | match | one-pass | 88 | 44 | **0.50×** |
+| anchored_email `\A(…)@(…)\z` | submatch | one-pass | 214 | 170 | **0.79×** |
+| **geomean** | | | | | **0.73×** |
 
 ## Analysis
 
-**General NFA engine (Pike VM): competitive-to-faster.** On the throughput-bound
-findall workloads the port is on-par to ~19% faster (`alternation` 0.81×,
-`digits` 0.84×, `date` 0.86×, `email`/`unicode`/`anchored_multiline` 0.89–0.92×).
-No GC, `-OReleaseFast`, and cheap arena scratch let a faithful port hold its own
-against Go's mature engine.
+**General NFA engine (Pike VM): faster across the board.** On the
+throughput-bound findall workloads the port is ~3–19% faster (`digits` 0.87×,
+`date` 0.81×, `email` 0.83×, `unicode`/`anchored_multiline` 0.82–0.89×). No GC,
+`-OReleaseFast`, an ASCII fast path in the rune decoder, and cheap arena scratch
+let a faithful port beat Go's mature engine.
 
-**Compilation is ~1.7× faster** — Go does more up-front work (engine analysis,
-prefix machinery) and pays GC overhead.
+**The first-byte prefilter turns former losses into the biggest wins.** When a
+pattern has no literal prefix but can only *start* with a few ASCII bytes, the
+port skips ahead with a vectorized byte scan where Go steps its NFA at every
+position. `caseins_literal` — `(?i)performance` scanned unanchored over 256 KB,
+formerly the port's one loss at 1.29× — now runs at **0.28×** (3.5× faster than
+Go): the scan spends its time in memchr looking for `p`/`P` instead of in the
+VM. `alternation` (first bytes of each branch) drops to **0.37×**, and
+`dotstar_greedy` to **0.71×**. Go has no equivalent accelerator.
 
-**Anchored "validation" patterns (one-pass): now faster than Go.** Anchored
+**Anchored "validation" patterns (one-pass): ~2× faster than Go.** Anchored
 regexps (`\A…\z`) — the bread-and-butter of input validation — qualify for the
-one-pass engine: a single deterministic pass with no thread set. The port's
-one-pass engine beats Go's on every such case (0.60–0.85×), including the
-case-insensitive `\A(?i)performance\z` (**0.85×**).
+one-pass engine: a single deterministic pass with no thread set. With the
+literal-prefix skip (`onePassPrefix`) and the ASCII decode fast path, the port
+now wins every such case at **0.48–0.79×**.
 
-**Three benchmark-driven gaps, all closed by porting the matching Go engine:**
+**Compilation is ~1.6× faster** — Go does more up-front work and pays GC
+overhead; the port spends a little extra on its one-pass deep copy and
+first-byte analysis, and still compiles well under half again as fast.
+
+**Benchmark-driven gaps, all closed by porting the matching Go machinery (or
+adding our own):**
 
 | gap | before | after | how |
 |-----|-------:|------:|-----|
-| literal search (`literal_miss`) | 310× | **0.89×** | literal-prefix accel + SIMD first-byte scan |
-| nested quantifier (`redos_linear`) | 3.89× | **1.12×** | bitstate backtracker (small inputs) |
-| anchored case-insensitive | 1.27× | **0.85×** | one-pass engine |
+| literal search (`literal_miss`) | 310× | **0.91×** | literal-prefix accel + SIMD first-byte scan |
+| nested quantifier (`redos_linear`) | 3.89× | **1.10×** | bitstate backtracker (small inputs) |
+| anchored case-insensitive | 1.27× | **0.63×** | one-pass engine + prefix skip |
+| unanchored case-insensitive | 1.29× | **0.28×** | first-byte prefilter (no Go counterpart) |
 
-`redos_linear` (1.12×) is the bitstate engine on a 2 KB input — both
-implementations are linear-time (no exponential blowup); Go's small-input
-constant is slightly lower.
-
-**The one remaining loss is `caseins_literal` (1.29×)** — `(?i)performance`
-scanned *unanchored* over 256 KB. This is **not** a one-pass case: one-pass
-requires anchoring, so Go runs it on the Pike VM too (its `LiteralPrefix` is
-empty for a folded literal, so neither engine can prefix-accelerate). The gap is
-a pure Pike-VM constant factor on the per-position case-fold check, not a
-missing engine. (The *anchored* counterpart, `anchored_caseins`, is one-pass and
-**faster** than Go.)
+**The one remaining loss is `redos_linear` (1.10×)** — the bitstate engine on a
+2 KB input, where Go's small-input constant is slightly lower. Both
+implementations are linear-time (no exponential blowup) and finish in
+single-digit microseconds.
 
 ## Allocation-free matching: the `Scratch` API
 
@@ -132,24 +142,22 @@ allocation dominated. Same patterns, same 200 ms calibration, Apple M4,
 
 | pattern | engine | Go `MatchString` | Zig `match` (alloc) | Zig `matchScratch` | scratch vs Go |
 |---------|--------|-----------------:|--------------------:|-------------------:|--------------:|
-| `needle` (literal) | bitstate+prefix | 47 | 56 | **26** | **0.55×** |
-| `\A\d+\z` (anchored) | one-pass | 90 | 61 | **53** | **0.59×** |
-| `[0-9]+` | bitstate | 90 | 129 | **89** | **0.99×** |
-| `(foo\|bar\|baz)+` | bitstate | 90 | 150 | **114** | 1.27× |
-| `[a-z]+@[a-z]+\.[a-z]+` | Pike VM | 376 | 535 | **458** | 1.22× |
+| `needle` (literal) | bitstate+prefix | 45 | 50 | **20** | **0.44×** |
+| `\A\d+\z` (anchored) | one-pass | 88 | 39 | **36** | **0.41×** |
+| `[0-9]+` | bitstate | 88 | 93 | **68** | **0.77×** |
+| `(foo\|bar\|baz)+` | bitstate+first-bytes | 87 | 68 | **41** | **0.47×** |
+| `[a-z]+@[a-z]+\.[a-z]+` | Pike VM | 366 | 346 | **283** | **0.77×** |
 
 Reading the table: **before** the `Scratch` API, per-call allocation made the
 port 1.3–1.6× *slower* than Go's pooled machine on the bitstate / Pike-VM
-patterns (only the no-alloc one-pass path was already ahead). **After** it, the
-allocation gap is gone — the numbers reduce to pure engine throughput: Zig wins
-on literal (vectorized prefix scan) and anchored (one-pass), ties on a simple
-char class, and Go keeps a ~1.2–1.3× constant-factor edge on the unanchored
-Pike-VM scans (the same constant factor documented above, not allocation).
+patterns. With the allocation gap closed, the numbers reduce to pure engine
+throughput — and after the first-byte prefilter and the ASCII decode fast
+path, the port now wins **every** row (0.41–0.77×), including the unanchored
+Pike-VM scan that used to be Go's remaining edge.
 
-> These are 20–50 byte inputs, where fixed per-op overhead weighs most and the
-> Pike-VM constant factor is most visible; on the 256 KB corpus above the port's
-> throughput pulls it to a **0.887×** geomean. The two views are consistent —
-> different input scales.
+> These are 20–50 byte inputs, where fixed per-op overhead weighs most; on the
+> 256 KB corpus above the same engines land at a **0.73×** geomean. The two
+> views are consistent — different input scales.
 
 ## Reproduce
 

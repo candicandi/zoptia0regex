@@ -20,15 +20,16 @@ byte-for-byte parity with Go**.
 
 Head-to-head against Go's standard-library `regexp` — same patterns, same
 inputs, same 256 KB corpus, same calibration, Zig built `ReleaseFast` —
-**zoptia0regex is ~11% faster on average** and compiles patterns **~1.7×
+**zoptia0regex is ~27% faster on average** and compiles patterns **~1.6×
 faster**. And it doesn't trade correctness for speed: ~30,000 differential tests
 prove its output is **byte-for-byte identical to Go's**.
 
 Not "inspired by." **Proven identical.**
 
 - 🚀 **Faster than Go at matching.** Geometric mean across 20 workloads:
-  **0.887×** Go's time. Anchored "validation" patterns hit the one-pass engine
-  and fly — up to **~1.7× faster**.
+  **0.73×** Go's time. Anchored "validation" patterns hit the one-pass engine
+  and fly — up to **~2× faster** — and a first-byte prefilter Go doesn't have
+  runs unanchored case-insensitive scans at **3.5× Go's speed**.
 - 🛡️ **Linear-time. ReDoS-proof.** Thompson NFA simulation means no catastrophic
   backtracking, ever. A pattern like `(a+)+` that hangs PCRE, JS, and Python
   runs in linear time here.
@@ -58,22 +59,22 @@ wins.
 
 | Workload | Engine | Zig / Go |
 |---|---|---|
-| `\A\d+\z` (anchored validation) | one-pass | **0.60×** |
-| `\A[a-z]+\z` (anchored validation) | one-pass | **0.64×** |
-| `\A(...)@(...)\z` with captures | one-pass | **0.84×** |
-| `\A(?i)performance\z` | one-pass | **0.85×** |
-| alternation | Pike VM | **0.81×** |
-| `\d+` | Pike VM | **0.84×** |
-| date scan | Pike VM | **0.86×** |
-| literal search | Pike VM | **0.89×** |
-| **Geometric mean (20 workloads)** | — | **0.887×** |
-| Pattern compilation | — | **0.575×** (~1.7× faster) |
+| `(?i)performance` (unanchored scan) | first-bytes + Pike VM | **0.28×** |
+| alternation | first-bytes + Pike VM | **0.37×** |
+| `\A[a-z]+\z` (anchored validation) | one-pass | **0.48×** |
+| `\A\d+\z` (anchored validation) | one-pass | **0.50×** |
+| `\A(?i)performance\z` | one-pass | **0.63×** |
+| `\A(...)@(...)\z` with captures | one-pass | **0.79×** |
+| date scan | Pike VM | **0.81×** |
+| `\d+` | Pike VM | **0.87×** |
+| **Geometric mean (20 workloads)** | — | **0.73×** |
+| Pattern compilation | — | **0.63×** (~1.6× faster) |
 
-**The honest caveat:** there is exactly **one** workload where Go wins — an
-*unanchored* case-insensitive scan (`(?i)performance` over 256 KB) at **1.29×**.
-That's a Pike-VM constant factor, not a missing engine (one-pass requires
-anchoring). Everything else is on par or faster. Full methodology and the
-complete table: **[BENCHMARKS.md](BENCHMARKS.md)**.
+**The honest caveat:** there is exactly **one** workload where Go wins — a
+nested-quantifier match on a small input (`(a+)+$`, bitstate engine) at
+**1.10×**, both sides in single-digit microseconds. Everything else is on par
+or faster. Full methodology and the complete table:
+**[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Why this exists
 
@@ -85,6 +86,13 @@ match semantics (plus **POSIX leftmost-longest**), the same `Find` / `Replace` /
 are here — the **one-pass** matcher, the **bitstate backtracker**, and the
 **Pike VM** — plus literal-prefix acceleration, with the engine chosen
 automatically per pattern.
+
+All three engines share literal-prefix acceleration (with a Rabin-Karp
+fallback, like Go's `bytes.Index`), and the port adds a **first-byte
+prefilter** Go doesn't have: when a pattern has no literal prefix but can only
+start with a few ASCII bytes — a case-insensitive literal, a small leading
+class — the unanchored engines skip ahead at memchr speed instead of stepping
+the NFA at every position.
 
 That's where the speed *and* the fidelity come from. For the full design
 walkthrough, see **[docs/internals.md](docs/internals.md)**.

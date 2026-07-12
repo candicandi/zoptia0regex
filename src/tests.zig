@@ -354,6 +354,49 @@ test "scratch reuse carries no stale state across patterns" {
     }
 }
 
+test "first-byte acceleration preserves semantics" {
+    // Case-insensitive literal: no literal prefix, but first_bytes = {P, p}.
+    {
+        var re = try regex.compile(ta, "(?i)performance");
+        defer re.deinit();
+        try std.testing.expectEqual(@as(usize, 2), re.first_bytes.len);
+        try std.testing.expect(try re.match(ta, "mid-sentence PERFormance test"));
+        try std.testing.expect(!try re.match(ta, "no hit in here at all"));
+        const m = (try re.findIndex(ta, "___pErFoRmAnCe")).?;
+        try std.testing.expectEqual(@as(usize, 3), m.start);
+    }
+    // Zero-width assertion before the first rune: the skip must recompute the
+    // boundary context, or \b would be evaluated with a stale flag.
+    {
+        var re = try regex.compile(ta, "\\bfoo");
+        defer re.deinit();
+        try std.testing.expect(re.first_bytes.len > 0);
+        try std.testing.expect(!try re.match(ta, "xxfoo")); // no boundary at 'f'
+        try std.testing.expect(try re.match(ta, "xx foo"));
+    }
+    // A fold cycle that leaves ASCII must disable the acceleration entirely,
+    // not silently miss the exotic fold: (?i)k also matches U+212A KELVIN SIGN.
+    {
+        var re = try regex.compile(ta, "(?i)kilo");
+        defer re.deinit();
+        try std.testing.expectEqual(@as(usize, 0), re.first_bytes.len);
+        try std.testing.expect(try re.match(ta, "\u{212A}ilo"));
+    }
+}
+
+test "one-pass literal-prefix skip" {
+    var re = try regex.compile(ta, "\\Afoobar(\\d+)\\z");
+    defer re.deinit();
+    try std.testing.expect(re.onepass != null);
+    try std.testing.expectEqualStrings("foobar", re.literalPrefix().prefix);
+    const subs = (try re.findSubmatch(ta, "foobar123")).?;
+    defer ta.free(subs);
+    try std.testing.expectEqualStrings("123", subs[1].?);
+    try std.testing.expect(!try re.match(ta, "fooba_123"));
+    try std.testing.expect(!try re.match(ta, "xfoobar12"));
+    try std.testing.expect(!try re.match(ta, "foobar"));
+}
+
 test "replace func" {
     var re = try regex.compile(ta, "\\d+");
     defer re.deinit();
